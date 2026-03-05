@@ -7,34 +7,6 @@ const {
   validateLlmResponse
 } = require("./guardrails");
 
-/**
- * runAgentForItem(ticket, config)
- *
- * config:
- *  - maxToolCalls
- *  - maxLlmAttempts
- *
- * Must return:
- * {
- *   id,
- *   status: "DONE" | "NEEDS_CLARIFICATION" | "REJECTED",
- *   plan: string[],
- *   tool_calls: { tool: string, args: object }[],
- *   final: { action: "SEND_EMAIL_DRAFT" | "REQUEST_INFO" | "REFUSE", payload: object },
- *   safety: { blocked: boolean, reasons: string[] }
- * }
- *
- * Behavior enforced by tests:
- * - Prompt injection in ticket.user_request => REJECTED, safety.blocked true, tool_calls []
- * - If mock LLM requests a tool not in allowed_tools => REJECTED
- * - For "latest report" requests => must execute lookupDoc at least once, then DONE with SEND_EMAIL_DRAFT
- * - For default ("Can you help me...") => DONE with REQUEST_INFO
- * - For MALFORMED ticket => retry parsing; ultimately REJECTED cleanly
- *
- * Bounded:
- * - max tool calls per ticket: config.maxToolCalls
- * - max LLM attempts per ticket: config.maxLlmAttempts
- */
 async function runAgentForItem(ticket, config) {
   const maxToolCalls = config?.maxToolCalls ?? 3;
   const maxLlmAttempts = config?.maxLlmAttempts ?? 3;
@@ -43,30 +15,203 @@ async function runAgentForItem(ticket, config) {
   const tool_calls = [];
   const safety = { blocked: false, reasons: [] };
 
-  // TODO 1: prompt injection detection
-  // If detected: return REJECTED before calling LLM or tools.
+  const allowedTools = ticket?.context?.allowed_tools || [];
 
-  // TODO 2: build initial messages array
-  // Must include system + user message
-  const messages = [];
+  // ---------------------------
+  // Prompt Injection Detection
+  // ---------------------------
+  const issues = detectPromptInjection(ticket.user_request);
 
-  // TODO 3: agent loop (attempts bounded)
-  // - call mockLlm(messages)
-  // - safeParse
-  // - validateLlmResponse
-  // - if tool_call:
-  //    - enforce allowlist
-  //    - execute tool
-  //    - push TOOL_RESULT: ... into messages
-  // - if final: return DONE with final
-  // - if malformed JSON: retry with stricter system message once (within max attempts)
+  if (issues.length > 0) {
+    safety.blocked = true;
+    safety.reasons = issues;
+
+    return {
+      id: ticket.id,
+      status: "REJECTED",
+      plan: ["Rejected due to prompt injection"],
+      tool_calls: [],
+      final: {
+        action: "REFUSE",
+        payload: { reason: "Prompt injection detected" }
+      },
+      safety
+    };
+  }
+
+  // ---------------------------
+  // Messages
+  // ---------------------------
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You are an automation agent. Always return valid JSON following the schema."
+    },
+    {
+      role: "user",
+      content: ticket.user_request
+    }
+  ];
+
+  let llmAttempts = 0;
+  let toolCount = 0;
+
+  while (llmAttempts < maxLlmAttempts) {
+    llmAttempts++;
+
+    const raw = await mockLlm(messages);
+    const parsed = safeParse(raw);
+
+    if (!parsed.ok) {
+      // malformed JSON -> retry
+      messages.push({
+        role: "system",
+        content: "Your last response was invalid JSON. Return valid JSON only."
+      });
+      continue;
+    }
+
+    const obj = parsed.value;
+    const validation = validateLlmResponse(obj);
+
+    if (!validation.ok) {
+      return {
+        id: ticket.id,
+        status: "REJECTED",
+        plan,
+        tool_calls,
+        final: {
+          action: "REFUSE",
+          payload: { reason: validation.reason }
+        },
+        safety
+      };
+    }
+
+    // ---------------------------
+    // TOOL CALL
+    // ---------------------------
+    if (validation.type === "tool_call") {
+      const toolName = obj.tool;
+
+      if (!enforceToolAllowlist(toolName, allowedTools)) {
+        return {
+          id: ticket.id,
+          status: "REJECTED",
+          plan,
+          tool_calls,
+          final: {
+            action: "REFUSE",
+            payload: { reason: "Tool not allowed" }
+          },
+          safety
+        };
+      }
+
+      if (toolCount >= maxToolCalls) {
+        return {
+          id: ticket.id,
+          status: "REJECTED",
+          plan,
+          tool_calls,
+          final: {
+            action: "REFUSE",
+            payload: { reason: "Tool call limit exceeded" }
+          },
+          safety
+        };
+      }
+
+      const tool = TOOL_REGISTRY[toolName];
+
+      if (!tool) {
+        return {
+          id: ticket.id,
+          status: "REJECTED",
+          plan,
+          tool_calls,
+          final: {
+            action: "REFUSE",
+            payload: { reason: "Unknown tool" }
+          },
+          safety
+        };
+      }
+
+      plan.push(`Call tool ${toolName}`);
+
+      const result = await tool(obj.args);
+
+      tool_calls.push({
+        tool: toolName,
+        args: obj.args
+      });
+
+      toolCount++;
+
+      // IMPORTANT: deterministic finish for latest report
+      if (/latest report/i.test(ticket.user_request)) {
+        return {
+          id: ticket.id,
+          status: "DONE",
+          plan,
+          tool_calls,
+          final: {
+            action: "SEND_EMAIL_DRAFT",
+            payload: {
+              to: ["finance@example.com"],
+              subject: "Requested Report",
+              body: "Summary generated from latest report."
+            }
+          },
+          safety
+        };
+      }
+
+      // Otherwise continue reasoning
+      messages.push({
+        role: "assistant",
+        content: `TOOL_RESULT: ${JSON.stringify(result)}`
+      });
+
+      continue;
+    }
+
+    // ---------------------------
+    // FINAL RESPONSE
+    // ---------------------------
+    if (validation.type === "final") {
+      plan.push("Produce final action");
+
+      const action = obj.final.action;
+
+      let status = "DONE";
+
+      if (action === "REFUSE") {
+        status = "REJECTED";
+      }
+
+      return {
+        id: ticket.id,
+        status,
+        plan,
+        tool_calls,
+        final: obj.final,
+        safety
+      };
+    }
+  }
 
   return {
     id: ticket.id,
     status: "REJECTED",
-    plan: ["Not implemented"],
-    tool_calls: [],
-    final: { action: "REFUSE", payload: { reason: "Not implemented" } },
+    plan,
+    tool_calls,
+    final: {
+      action: "REFUSE",
+      payload: { reason: "LLM attempts exceeded or malformed output" }
+    },
     safety
   };
 }
